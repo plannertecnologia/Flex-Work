@@ -8,7 +8,7 @@ type Contract={id:string;title:string;client_id:string;freelancer_id:string;gros
 type Project={id:string;title:string;description:string;client_id:string;status:string;budget_min_cents:number|null;budget_max_cents:number|null;proposals_count:number;created_at:string};
 type Proposal={id:string;freelancer_id:string;client_id:string;price_cents:number;delivery_days:number;message:string;revisions:number;status:string};
 const money=(cents:number|null|undefined)=>cents==null?'Sob orçamento':new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(cents/100);
-const errMessage=(err:unknown)=>err instanceof Error?err.message:String(err);
+ const errMessage = (err: unknown): string => {   if (err instanceof Error) return err.message;    if (err && typeof err === "object") {     const error = err as {       message?: string;       details?: string;       hint?: string;       code?: string;     };      return [       error.message,       error.details,       error.hint,       error.code ? `Código: ${error.code}` : null     ].filter(Boolean).join(" | ") || "Erro desconhecido.";   }    return String(err); };
 function Screen({children}:{children:React.ReactNode}){return <main className="shell pad marketplace-screen">{children}</main>}
 function Alert({text}:{text:string}){return text?<p className="formMessage" role="status">{text}</p>:null}
 function Status({value}:{value:string}){return <span className={'fw-status '+(value==='concluido'||value==='pagamento_confirmado'||value==='aprovado'?'good':'')}>{value.replaceAll('_',' ')}</span>}
