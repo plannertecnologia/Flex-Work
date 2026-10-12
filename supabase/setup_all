@@ -1,0 +1,1428 @@
+-- DALI Tech Marketplace — setup completo (gerado a partir de migrations/). Execute no SQL Editor.
+
+-- >>> migrations/20260101000001_core_schema.sql
+-- =====================================================================
+-- DALI Tech Marketplace — 0001 Core schema
+-- Todas as tabelas do escopo completo (Fases 1–6). Fases 1–2 já usam:
+-- profiles, profile_private, consents, data_requests, user_roles,
+-- categories, freelancer_profiles, freelancer_skills, services,
+-- service_packages, service_extras, portfolios, favorites,
+-- platform_settings, audit_logs.
+-- As demais já existem para evitar retrabalho nas próximas fases.
+-- Valores monetários SEMPRE em centavos inteiros (bigint).
+-- =====================================================================
+
+create extension if not exists pgcrypto with schema extensions;
+create extension if not exists unaccent with schema extensions;
+create extension if not exists pg_trgm with schema extensions;
+
+-- ---------------------------------------------------------------------
+-- Helpers
+-- ---------------------------------------------------------------------
+create or replace function public.set_updated_at()
+returns trigger language plpgsql as $$
+begin
+  new.updated_at = now();
+  return new;
+end $$;
+
+create or replace function public.slugify(txt text)
+returns text language sql immutable as $$
+  select trim(both '-' from regexp_replace(lower(extensions.unaccent(coalesce(txt, ''))), '[^a-z0-9]+', '-', 'g'))
+$$;
+
+-- ---------------------------------------------------------------------
+-- Roles (admin só é atribuído via SQL/service_role — nunca pelo front)
+-- ---------------------------------------------------------------------
+create table if not exists public.user_roles (
+  user_id    uuid not null references auth.users(id) on delete cascade,
+  role       text not null check (role in ('admin', 'moderator')),
+  granted_at timestamptz not null default now(),
+  granted_by uuid,
+  primary key (user_id, role)
+);
+
+create or replace function public.is_admin()
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.user_roles where user_id = auth.uid() and role = 'admin')
+$$;
+
+-- true quando a chamada vem do SQL Editor / service_role (Edge Functions)
+create or replace function public.is_service_context()
+returns boolean language sql stable as $$
+  select coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role', '') in ('service_role', '')
+$$;
+
+create or replace function public.is_privileged()
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.is_service_context() or public.is_admin()
+$$;
+
+-- ---------------------------------------------------------------------
+-- Perfis
+-- ---------------------------------------------------------------------
+create table if not exists public.profiles (
+  id           uuid primary key references auth.users(id) on delete cascade,
+  full_name    text not null default '' check (char_length(full_name) <= 120),
+  display_name text check (char_length(display_name) <= 80),
+  avatar_url   text,
+  person_type  text not null default 'pf' check (person_type in ('pf', 'pj')),
+  company_name text check (char_length(company_name) <= 160),
+  city         text check (char_length(city) <= 80),
+  state        text check (state is null or char_length(state) = 2),
+  headline     text check (char_length(headline) <= 160),
+  active_mode  text not null default 'client' check (active_mode in ('client', 'freelancer')),
+  status       text not null default 'ativo' check (status in ('ativo', 'suspenso', 'excluido')),
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+
+-- dados pessoais sensíveis (LGPD): visíveis só ao dono e admin
+create table if not exists public.profile_private (
+  user_id         uuid primary key references public.profiles(id) on delete cascade,
+  document_number text check (char_length(document_number) <= 20),
+  phone           text check (char_length(phone) <= 20),
+  birth_date      date,
+  updated_at      timestamptz not null default now()
+);
+
+create table if not exists public.consents (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references auth.users(id) on delete cascade,
+  kind       text not null check (kind in ('termos_uso', 'politica_privacidade', 'marketing', 'cookies')),
+  version    text not null,
+  granted    boolean not null default true,
+  created_at timestamptz not null default now()
+);
+create index if not exists consents_user_idx on public.consents(user_id, kind);
+
+create table if not exists public.data_requests (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users(id) on delete cascade,
+  kind        text not null check (kind in ('acesso', 'exclusao', 'correcao', 'portabilidade')),
+  details     text check (char_length(details) <= 2000),
+  status      text not null default 'aberta' check (status in ('aberta', 'em_analise', 'concluida', 'recusada')),
+  admin_notes text,
+  created_at  timestamptz not null default now(),
+  resolved_at timestamptz
+);
+create index if not exists data_requests_user_idx on public.data_requests(user_id);
+
+-- ---------------------------------------------------------------------
+-- Categorias (hierarquia 2 níveis: categoria → subcategoria)
+-- ---------------------------------------------------------------------
+create table if not exists public.categories (
+  id          uuid primary key default gen_random_uuid(),
+  parent_id   uuid references public.categories(id) on delete restrict,
+  slug        text not null unique check (slug ~ '^[a-z0-9-]{2,80}$'),
+  name        text not null check (char_length(name) between 2 and 80),
+  description text check (char_length(description) <= 400),
+  icon        text,
+  sort_order  int not null default 0,
+  is_active   boolean not null default true,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+create index if not exists categories_parent_idx on public.categories(parent_id, sort_order);
+
+-- ---------------------------------------------------------------------
+-- Freelancers
+-- ---------------------------------------------------------------------
+create table if not exists public.freelancer_profiles (
+  user_id            uuid primary key references public.profiles(id) on delete cascade,
+  slug               text not null unique check (slug ~ '^[a-z0-9][a-z0-9-]{2,70}$'),
+  professional_title text not null default '' check (char_length(professional_title) <= 120),
+  bio                text check (char_length(bio) <= 4000),
+  main_category_id   uuid references public.categories(id) on delete set null,
+  level              text not null default 'iniciante' check (level in ('iniciante', 'intermediario', 'especialista')),
+  experience_years   int not null default 0 check (experience_years between 0 and 60),
+  availability       text not null default 'disponivel' check (availability in ('disponivel', 'ocupado', 'indisponivel')),
+  response_time_hours int check (response_time_hours between 1 and 168),
+  experiences        jsonb not null default '[]'::jsonb,
+  education          jsonb not null default '[]'::jsonb,
+  certifications     jsonb not null default '[]'::jsonb,
+  languages          text[] not null default '{}',
+  website_url        text,
+  linkedin_url       text,
+  github_url         text,
+  -- moderação (somente admin)
+  approval_status    text not null default 'pendente' check (approval_status in ('pendente', 'aprovado', 'rejeitado')),
+  approval_notes     text,
+  approved_at        timestamptz,
+  approved_by        uuid,
+  identity_verified  boolean not null default false,
+  -- reputação (somente sistema)
+  rating_avg         numeric(3,2) not null default 0,
+  rating_count       int not null default 0,
+  completed_projects int not null default 0,
+  on_time_rate       numeric(5,2),
+  score              numeric(5,2),
+  score_updated_at   timestamptz,
+  is_new_talent      boolean not null default true,
+  profile_views      int not null default 0,
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now()
+);
+create index if not exists fp_approval_idx on public.freelancer_profiles(approval_status);
+create index if not exists fp_category_idx on public.freelancer_profiles(main_category_id);
+create index if not exists fp_score_idx on public.freelancer_profiles(score desc nulls last);
+
+create table if not exists public.freelancer_skills (
+  id            uuid primary key default gen_random_uuid(),
+  freelancer_id uuid not null references public.freelancer_profiles(user_id) on delete cascade,
+  name          text not null check (char_length(name) between 1 and 60),
+  category_id   uuid references public.categories(id) on delete set null,
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists freelancer_skills_unique on public.freelancer_skills(freelancer_id, lower(name));
+
+-- ---------------------------------------------------------------------
+-- Serviços (anúncios) + pacotes + extras
+-- ---------------------------------------------------------------------
+create table if not exists public.services (
+  id                   uuid primary key default gen_random_uuid(),
+  freelancer_id        uuid not null references public.freelancer_profiles(user_id) on delete cascade,
+  category_id          uuid not null references public.categories(id),
+  subcategory_id       uuid references public.categories(id),
+  title                text not null check (char_length(title) between 10 and 120),
+  description          text not null check (char_length(description) between 30 and 8000),
+  cover_url            text,
+  gallery              jsonb not null default '[]'::jsonb,
+  demo_files           jsonb not null default '[]'::jsonb,
+  requirements         text check (char_length(requirements) <= 4000),
+  faq                  jsonb not null default '[]'::jsonb,
+  tags                 text[] not null default '{}',
+  status               text not null default 'rascunho' check (status in ('rascunho', 'publicado', 'pausado', 'suspenso')),
+  moderation_notes     text,
+  starting_price_cents bigint,
+  min_delivery_days    int,
+  views_count          int not null default 0,
+  verified_sales_count int not null default 0,
+  rating_avg           numeric(3,2) not null default 0,
+  rating_count         int not null default 0,
+  is_featured          boolean not null default false,
+  search               tsvector,
+  published_at         timestamptz,
+  created_at           timestamptz not null default now(),
+  updated_at           timestamptz not null default now()
+);
+create index if not exists services_search_idx on public.services using gin(search);
+create index if not exists services_status_cat_idx on public.services(status, category_id, subcategory_id);
+create index if not exists services_freelancer_idx on public.services(freelancer_id);
+create index if not exists services_price_idx on public.services(starting_price_cents);
+create index if not exists services_published_idx on public.services(published_at desc);
+
+create table if not exists public.service_packages (
+  id            uuid primary key default gen_random_uuid(),
+  service_id    uuid not null references public.services(id) on delete cascade,
+  tier          text not null check (tier in ('basico', 'profissional', 'premium')),
+  name          text not null check (char_length(name) between 2 and 60),
+  description   text check (char_length(description) <= 600),
+  price_cents   bigint not null check (price_cents between 500 and 100000000),
+  delivery_days int not null check (delivery_days between 1 and 365),
+  revisions     int not null default 1 check (revisions between 0 and 20),
+  deliverables  text[] not null default '{}',
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now(),
+  unique (service_id, tier)
+);
+
+create table if not exists public.service_extras (
+  id          uuid primary key default gen_random_uuid(),
+  service_id  uuid not null references public.services(id) on delete cascade,
+  kind        text not null default 'outro' check (kind in ('entrega_prioritaria', 'revisao_adicional', 'outro')),
+  title       text not null check (char_length(title) between 2 and 80),
+  description text check (char_length(description) <= 300),
+  price_cents bigint not null check (price_cents between 100 and 10000000),
+  extra_days  int not null default 0 check (extra_days between -30 and 60),
+  created_at  timestamptz not null default now()
+);
+create index if not exists service_extras_service_idx on public.service_extras(service_id);
+
+-- ---------------------------------------------------------------------
+-- Portfólio
+-- ---------------------------------------------------------------------
+create table if not exists public.portfolios (
+  id            uuid primary key default gen_random_uuid(),
+  freelancer_id uuid not null references public.freelancer_profiles(user_id) on delete cascade,
+  title         text not null check (char_length(title) between 3 and 120),
+  description   text check (char_length(description) <= 3000),
+  category_id   uuid references public.categories(id) on delete set null,
+  tools         text[] not null default '{}',
+  cover_url     text,
+  gallery       jsonb not null default '[]'::jsonb,
+  pdf_url       text,
+  link_url      text,
+  results       text check (char_length(results) <= 1000),
+  approx_date   date,
+  project_type  text check (char_length(project_type) <= 60),
+  origin        text not null default 'declarado' check (origin in ('declarado', 'plataforma')),
+  is_verified   boolean not null default false,
+  contract_id   uuid,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+create index if not exists portfolios_freelancer_idx on public.portfolios(freelancer_id, created_at desc);
+
+-- ---------------------------------------------------------------------
+-- Favoritos
+-- ---------------------------------------------------------------------
+create table if not exists public.favorites (
+  id            uuid primary key default gen_random_uuid(),
+  user_id       uuid not null references auth.users(id) on delete cascade,
+  service_id    uuid references public.services(id) on delete cascade,
+  freelancer_id uuid references public.freelancer_profiles(user_id) on delete cascade,
+  created_at    timestamptz not null default now(),
+  check ((service_id is not null)::int + (freelancer_id is not null)::int = 1)
+);
+create unique index if not exists favorites_service_uq on public.favorites(user_id, service_id) where service_id is not null;
+create unique index if not exists favorites_freelancer_uq on public.favorites(user_id, freelancer_id) where freelancer_id is not null;
+
+-- ---------------------------------------------------------------------
+-- Configurações e auditoria
+-- ---------------------------------------------------------------------
+create table if not exists public.platform_settings (
+  key         text primary key,
+  value       jsonb not null,
+  description text,
+  is_public   boolean not null default false,
+  updated_at  timestamptz not null default now(),
+  updated_by  uuid
+);
+
+create table if not exists public.audit_logs (
+  id         bigint generated always as identity primary key,
+  actor_id   uuid,
+  action     text not null,
+  entity     text not null,
+  entity_id  text,
+  old_data   jsonb,
+  new_data   jsonb,
+  created_at timestamptz not null default now()
+);
+create index if not exists audit_logs_created_idx on public.audit_logs(created_at desc);
+create index if not exists audit_logs_entity_idx on public.audit_logs(entity, entity_id);
+
+-- =====================================================================
+-- FASES 3–6 (estrutura pronta; regras de negócio entram nas próximas fases)
+-- =====================================================================
+create table if not exists public.projects (
+  id                     uuid primary key default gen_random_uuid(),
+  client_id              uuid not null references public.profiles(id) on delete cascade,
+  title                  text not null check (char_length(title) between 5 and 140),
+  description            text not null check (char_length(description) between 20 and 8000),
+  category_id            uuid references public.categories(id),
+  subcategory_id         uuid references public.categories(id),
+  budget_min_cents       bigint check (budget_min_cents >= 0),
+  budget_max_cents       bigint check (budget_max_cents >= 0),
+  desired_deadline       date,
+  urgency                text not null default 'media' check (urgency in ('baixa', 'media', 'alta')),
+  technical_requirements text,
+  attachments            jsonb not null default '[]'::jsonb,
+  status                 text not null default 'aberto' check (status in ('rascunho', 'aberto', 'em_negociacao', 'contratado', 'cancelado', 'encerrado')),
+  proposals_count        int not null default 0,
+  created_at             timestamptz not null default now(),
+  updated_at             timestamptz not null default now()
+);
+create index if not exists projects_status_idx on public.projects(status, category_id, created_at desc);
+create index if not exists projects_client_idx on public.projects(client_id);
+
+create table if not exists public.proposals (
+  id            uuid primary key default gen_random_uuid(),
+  kind          text not null default 'proposta' check (kind in ('proposta', 'orcamento')),
+  project_id    uuid references public.projects(id) on delete cascade,
+  service_id    uuid references public.services(id) on delete set null,
+  client_id     uuid not null references public.profiles(id) on delete cascade,
+  freelancer_id uuid not null references public.freelancer_profiles(user_id) on delete cascade,
+  price_cents   bigint check (price_cents >= 500),
+  delivery_days int check (delivery_days between 1 and 365),
+  message       text check (char_length(message) <= 4000),
+  deliverables  text[] not null default '{}',
+  revisions     int not null default 1 check (revisions between 0 and 20),
+  portfolio_ids uuid[] not null default '{}',
+  status        text not null default 'enviada' check (status in ('solicitada', 'enviada', 'em_negociacao', 'aceita', 'recusada', 'retirada', 'expirada')),
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+create index if not exists proposals_project_idx on public.proposals(project_id);
+create index if not exists proposals_freelancer_idx on public.proposals(freelancer_id, status);
+create index if not exists proposals_client_idx on public.proposals(client_id, status);
+
+create table if not exists public.contracts (
+  id                 uuid primary key default gen_random_uuid(),
+  client_id          uuid not null references public.profiles(id),
+  freelancer_id      uuid not null references public.freelancer_profiles(user_id),
+  service_id         uuid references public.services(id) on delete set null,
+  package_id         uuid references public.service_packages(id) on delete set null,
+  proposal_id        uuid references public.proposals(id) on delete set null,
+  project_id         uuid references public.projects(id) on delete set null,
+  title              text not null,
+  gross_amount_cents bigint not null check (gross_amount_cents > 0),
+  commission_bps     int not null check (commission_bps between 0 and 5000),  -- snapshot da regra vigente
+  commission_cents   bigint not null check (commission_cents >= 0),
+  status             text not null default 'aguardando_pagamento' check (status in (
+    'gerado', 'aguardando_pagamento', 'pagamento_confirmado', 'em_execucao', 'entrega_enviada',
+    'aguardando_analise', 'revisao_solicitada', 'entrega_aprovada', 'concluido',
+    'cancelado', 'em_disputa', 'reembolsado', 'falha_pagamento', 'chargeback', 'abandonado')),
+  current_version    int not null default 1,
+  revisions_allowed  int not null default 1,
+  revisions_used     int not null default 0,
+  due_at             timestamptz,
+  started_at         timestamptz,
+  delivered_at       timestamptz,
+  approved_at        timestamptz,
+  completed_at       timestamptz,
+  cancelled_at       timestamptz,
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now(),
+  check (client_id <> freelancer_id)
+);
+create index if not exists contracts_client_idx on public.contracts(client_id, status);
+create index if not exists contracts_freelancer_idx on public.contracts(freelancer_id, status);
+
+alter table public.portfolios drop constraint if exists portfolios_contract_fk;
+alter table public.portfolios add constraint portfolios_contract_fk foreign key (contract_id) references public.contracts(id) on delete set null;
+
+create table if not exists public.contract_versions (
+  id                       uuid primary key default gen_random_uuid(),
+  contract_id              uuid not null references public.contracts(id) on delete cascade,
+  version                  int not null,
+  reason                   text not null default 'original' check (reason in ('original', 'aditivo')),
+  scope                    jsonb not null,
+  amount_cents             bigint not null,
+  delivery_days            int not null,
+  revisions                int not null,
+  accepted_by_client_at    timestamptz,
+  accepted_by_freelancer_at timestamptz,
+  created_by               uuid,
+  created_at               timestamptz not null default now(),
+  unique (contract_id, version)
+);
+
+create table if not exists public.contract_events (
+  id          bigint generated always as identity primary key,
+  contract_id uuid not null references public.contracts(id) on delete cascade,
+  event       text not null,
+  from_status text,
+  to_status   text,
+  actor_id    uuid,
+  payload     jsonb,
+  created_at  timestamptz not null default now()
+);
+create index if not exists contract_events_idx on public.contract_events(contract_id, created_at);
+
+create table if not exists public.conversations (
+  id              uuid primary key default gen_random_uuid(),
+  kind            text not null default 'direto' check (kind in ('direto', 'contrato', 'projeto')),
+  contract_id     uuid references public.contracts(id) on delete cascade,
+  project_id      uuid references public.projects(id) on delete cascade,
+  last_message_at timestamptz,
+  created_at      timestamptz not null default now()
+);
+
+create table if not exists public.conversation_participants (
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  user_id         uuid not null references auth.users(id) on delete cascade,
+  last_read_at    timestamptz,
+  primary key (conversation_id, user_id)
+);
+create index if not exists conv_participants_user_idx on public.conversation_participants(user_id);
+
+create table if not exists public.messages (
+  id              uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  sender_id       uuid references auth.users(id) on delete set null,
+  kind            text not null default 'texto' check (kind in ('texto', 'sistema', 'acordo', 'arquivo')),
+  body            text check (char_length(body) <= 5000),
+  attachments     jsonb not null default '[]'::jsonb,
+  created_at      timestamptz not null default now()
+);
+create index if not exists messages_conv_idx on public.messages(conversation_id, created_at desc);
+
+create table if not exists public.deliverables (
+  id           uuid primary key default gen_random_uuid(),
+  contract_id  uuid not null references public.contracts(id) on delete cascade,
+  version      int not null,
+  notes        text,
+  files        jsonb not null default '[]'::jsonb,
+  links        text[] not null default '{}',
+  submitted_by uuid not null references auth.users(id),
+  status       text not null default 'enviada' check (status in ('enviada', 'aprovada', 'revisao_solicitada', 'contestada')),
+  created_at   timestamptz not null default now(),
+  unique (contract_id, version)
+);
+
+create table if not exists public.revisions (
+  id             uuid primary key default gen_random_uuid(),
+  contract_id    uuid not null references public.contracts(id) on delete cascade,
+  deliverable_id uuid references public.deliverables(id) on delete set null,
+  requested_by   uuid not null references auth.users(id),
+  reason         text not null,
+  status         text not null default 'aberta' check (status in ('aberta', 'atendida', 'recusada')),
+  created_at     timestamptz not null default now()
+);
+
+create table if not exists public.reviews (
+  id               uuid primary key default gen_random_uuid(),
+  contract_id      uuid not null unique references public.contracts(id) on delete cascade,
+  reviewer_id      uuid not null references auth.users(id),
+  freelancer_id    uuid not null references public.freelancer_profiles(user_id),
+  service_id       uuid references public.services(id) on delete set null,
+  quality          smallint not null check (quality between 1 and 5),
+  communication    smallint not null check (communication between 1 and 5),
+  deadline         smallint not null check (deadline between 1 and 5),
+  scope            smallint not null check (scope between 1 and 5),
+  overall          smallint not null check (overall between 1 and 5),
+  comment          text check (char_length(comment) <= 2000),
+  freelancer_reply text check (char_length(freelancer_reply) <= 2000),
+  replied_at       timestamptz,
+  status           text not null default 'publicada' check (status in ('publicada', 'em_moderacao', 'oculta')),
+  created_at       timestamptz not null default now(),
+  check (reviewer_id <> freelancer_id)
+);
+create index if not exists reviews_freelancer_idx on public.reviews(freelancer_id, created_at desc);
+
+create table if not exists public.review_reports (
+  id          uuid primary key default gen_random_uuid(),
+  review_id   uuid not null references public.reviews(id) on delete cascade,
+  reporter_id uuid not null references auth.users(id),
+  reason      text not null,
+  status      text not null default 'aberta' check (status in ('aberta', 'procedente', 'improcedente')),
+  created_at  timestamptz not null default now()
+);
+
+create table if not exists public.reputation_scores (
+  id            bigint generated always as identity primary key,
+  freelancer_id uuid not null references public.freelancer_profiles(user_id) on delete cascade,
+  score         numeric(5,2),
+  components    jsonb not null,  -- {avaliacoes:30, pontualidade:25, conclusao:20, qualidade:15, resposta:10}
+  sample_size   int not null default 0,
+  computed_at   timestamptz not null default now()
+);
+create index if not exists reputation_scores_idx on public.reputation_scores(freelancer_id, computed_at desc);
+
+create table if not exists public.badges (
+  code        text primary key,
+  name        text not null,
+  description text,
+  icon        text,
+  criteria    jsonb
+);
+
+create table if not exists public.freelancer_badges (
+  freelancer_id uuid not null references public.freelancer_profiles(user_id) on delete cascade,
+  badge_code    text not null references public.badges(code),
+  awarded_at    timestamptz not null default now(),
+  primary key (freelancer_id, badge_code)
+);
+
+create table if not exists public.provider_accounts (
+  id                  uuid primary key default gen_random_uuid(),
+  user_id             uuid not null references auth.users(id) on delete cascade,
+  provider            text not null default 'asaas' check (provider in ('asaas', 'stripe', 'pagbank')),
+  external_account_id text,
+  wallet_id           text,
+  status              text not null default 'pendente' check (status in ('pendente', 'ativa', 'recusada', 'desativada')),
+  onboarding_data     jsonb not null default '{}'::jsonb,  -- nunca armazenar segredos aqui
+  created_at          timestamptz not null default now(),
+  updated_at          timestamptz not null default now(),
+  unique (user_id, provider)
+);
+
+create table if not exists public.payments (
+  id                    uuid primary key default gen_random_uuid(),
+  contract_id           uuid not null references public.contracts(id),
+  provider              text not null default 'asaas',
+  external_id           text,
+  idempotency_key       text not null unique,
+  method                text check (method in ('pix', 'cartao', 'boleto')),
+  installments          int not null default 1,
+  gross_cents           bigint not null check (gross_cents > 0),
+  provider_fee_cents    bigint,
+  net_cents             bigint,
+  status                text not null default 'pendente' check (status in (
+    'pendente', 'aguardando_pagamento', 'confirmado', 'recebido', 'falhou', 'cancelado',
+    'reembolsado', 'reembolso_parcial', 'chargeback')),
+  reconciliation_status text not null default 'pendente' check (reconciliation_status in ('pendente', 'conciliado', 'divergente')),
+  due_date              date,
+  paid_at               timestamptz,
+  settled_at            timestamptz,
+  failure_reason        text,
+  created_at            timestamptz not null default now(),
+  updated_at            timestamptz not null default now(),
+  unique (provider, external_id)
+);
+create index if not exists payments_contract_idx on public.payments(contract_id);
+
+create table if not exists public.payment_splits (
+  id                 uuid primary key default gen_random_uuid(),
+  payment_id         uuid not null references public.payments(id) on delete cascade,
+  recipient_user_id  uuid references auth.users(id),
+  wallet_id          text not null,
+  fixed_value_cents  bigint,
+  expected_cents     bigint not null,
+  actual_cents       bigint,
+  status             text not null default 'previsto' check (status in ('previsto', 'confirmado', 'divergente', 'cancelado')),
+  external_id        text,
+  created_at         timestamptz not null default now()
+);
+
+create table if not exists public.commissions (
+  id                     uuid primary key default gen_random_uuid(),
+  contract_id            uuid not null references public.contracts(id),
+  payment_id             uuid references public.payments(id),
+  rate_bps               int not null,
+  gross_cents            bigint not null,
+  commission_cents       bigint not null,
+  provider_fee_cents     bigint,
+  freelancer_gross_cents bigint not null,
+  status                 text not null default 'prevista' check (status in ('prevista', 'confirmada', 'estornada')),
+  created_at             timestamptz not null default now()
+);
+
+create table if not exists public.refunds (
+  id           uuid primary key default gen_random_uuid(),
+  payment_id   uuid not null references public.payments(id),
+  contract_id  uuid not null references public.contracts(id),
+  amount_cents bigint not null check (amount_cents > 0),
+  reason       text,
+  status       text not null default 'solicitado' check (status in ('solicitado', 'processando', 'concluido', 'falhou')),
+  external_id  text,
+  requested_by uuid references auth.users(id),
+  created_at   timestamptz not null default now()
+);
+
+create table if not exists public.disputes (
+  id          uuid primary key default gen_random_uuid(),
+  contract_id uuid not null references public.contracts(id),
+  opened_by   uuid not null references auth.users(id),
+  reason      text not null,
+  description text,
+  status      text not null default 'aberta' check (status in ('aberta', 'em_analise', 'resolvida_cliente', 'resolvida_freelancer', 'acordo', 'encerrada')),
+  resolution  text,
+  resolved_by uuid,
+  created_at  timestamptz not null default now(),
+  resolved_at timestamptz
+);
+
+create table if not exists public.payment_webhook_events (
+  id           bigint generated always as identity primary key,
+  provider     text not null,
+  event_id     text not null,
+  event_type   text not null,
+  payload      jsonb not null,
+  status       text not null default 'recebido' check (status in ('recebido', 'processado', 'ignorado', 'erro')),
+  error        text,
+  processed_at timestamptz,
+  created_at   timestamptz not null default now(),
+  unique (provider, event_id)
+);
+
+create table if not exists public.notifications (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references auth.users(id) on delete cascade,
+  kind       text not null,
+  title      text not null,
+  body       text,
+  link       text,
+  read_at    timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists notifications_user_idx on public.notifications(user_id, read_at, created_at desc);
+
+-- >>> migrations/20260101000002_functions_triggers.sql
+-- =====================================================================
+-- DALI Tech Marketplace — 0002 Funções, triggers e views
+-- =====================================================================
+
+-- updated_at
+do $$
+declare t text;
+begin
+  foreach t in array array['profiles','profile_private','categories','freelancer_profiles','services',
+                           'service_packages','portfolios','projects','proposals','contracts',
+                           'payments','provider_accounts']
+  loop
+    execute format('drop trigger if exists trg_%1$s_updated on public.%1$s', t);
+    execute format('create trigger trg_%1$s_updated before update on public.%1$s for each row execute function public.set_updated_at()', t);
+  end loop;
+end $$;
+
+-- ---------------------------------------------------------------------
+-- Novo usuário (Supabase Auth) → profiles / profile_private / consents
+-- ---------------------------------------------------------------------
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  meta jsonb := coalesce(new.raw_user_meta_data, '{}'::jsonb);
+  v_name text := left(coalesce(meta ->> 'full_name', ''), 120);
+  v_type text := case when meta ->> 'person_type' in ('pf', 'pj') then meta ->> 'person_type' else 'pf' end;
+  v_terms text := meta ->> 'accepted_terms_version';
+  v_wants_freelancer boolean := coalesce((meta ->> 'wants_freelancer')::boolean, false);
+begin
+  insert into public.profiles (id, full_name, person_type, company_name, active_mode)
+  values (new.id, v_name, v_type, nullif(left(coalesce(meta ->> 'company_name', ''), 160), ''),
+          case when v_wants_freelancer then 'freelancer' else 'client' end)
+  on conflict (id) do nothing;
+
+  insert into public.profile_private (user_id) values (new.id) on conflict do nothing;
+
+  if coalesce(v_terms, '') <> '' then
+    insert into public.consents (user_id, kind, version)
+    values (new.id, 'termos_uso', v_terms), (new.id, 'politica_privacidade', v_terms);
+  end if;
+  if coalesce((meta ->> 'marketing_opt_in')::boolean, false) then
+    insert into public.consents (user_id, kind, version) values (new.id, 'marketing', coalesce(v_terms, 'v1'));
+  end if;
+
+  if v_wants_freelancer then
+    begin
+      insert into public.freelancer_profiles (user_id, slug)
+      values (new.id, left(coalesce(nullif(public.slugify(v_name), ''), 'profissional'), 50) || '-' || substr(replace(new.id::text, '-', ''), 1, 6))
+      on conflict do nothing;
+    exception when others then
+      raise warning 'handle_new_user: freelancer_profiles não criado para %: %', new.id, sqlerrm;
+    end;
+  end if;
+  return new;
+exception when others then
+  -- nunca bloquear o cadastro no Supabase Auth; o front-end recria o perfil se faltar
+  raise warning 'handle_new_user falhou para %: %', new.id, sqlerrm;
+  return new;
+end $$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- ---------------------------------------------------------------------
+-- Proteções de colunas (usuário comum não altera status/score/moderação)
+-- ---------------------------------------------------------------------
+create or replace function public.protect_profiles()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if not public.is_privileged() then
+    if tg_op = 'INSERT' then
+      new.status := 'ativo';
+    else
+      new.status := old.status;
+      new.id := old.id;
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists trg_protect_profiles on public.profiles;
+create trigger trg_protect_profiles before insert or update on public.profiles
+  for each row execute function public.protect_profiles();
+
+create or replace function public.protect_freelancer_profiles()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if tg_op = 'INSERT' then
+    if new.slug is null or new.slug = '' then
+      new.slug := left(coalesce(nullif(public.slugify(new.professional_title), ''), 'profissional'), 50)
+                  || '-' || substr(replace(new.user_id::text, '-', ''), 1, 6);
+    end if;
+    if not public.is_privileged() then
+      new.approval_status := 'pendente'; new.approval_notes := null; new.approved_at := null; new.approved_by := null;
+      new.identity_verified := false; new.rating_avg := 0; new.rating_count := 0; new.completed_projects := 0;
+      new.on_time_rate := null; new.score := null; new.score_updated_at := null; new.is_new_talent := true;
+      new.profile_views := 0;
+    end if;
+    return new;
+  end if;
+
+  if not public.is_privileged() then
+    new.user_id := old.user_id;
+    new.approval_notes := old.approval_notes; new.approved_at := old.approved_at; new.approved_by := old.approved_by;
+    new.identity_verified := old.identity_verified; new.rating_avg := old.rating_avg; new.rating_count := old.rating_count;
+    new.completed_projects := old.completed_projects; new.on_time_rate := old.on_time_rate; new.score := old.score;
+    new.score_updated_at := old.score_updated_at; new.is_new_talent := old.is_new_talent; new.profile_views := old.profile_views;
+    -- perfil rejeitado volta para análise quando o profissional edita
+    new.approval_status := case when old.approval_status = 'rejeitado' then 'pendente' else old.approval_status end;
+  elsif new.approval_status is distinct from old.approval_status and new.approval_status = 'aprovado' then
+    new.approved_at := now();
+    new.approved_by := auth.uid();
+  end if;
+  return new;
+end $$;
+drop trigger if exists trg_protect_fp on public.freelancer_profiles;
+create trigger trg_protect_fp before insert or update on public.freelancer_profiles
+  for each row execute function public.protect_freelancer_profiles();
+
+-- serviços: busca full-text, métricas e moderação
+create or replace function public.services_before_write()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  new.search :=
+    setweight(to_tsvector('portuguese', extensions.unaccent(coalesce(new.title, ''))), 'A') ||
+    setweight(to_tsvector('portuguese', extensions.unaccent(coalesce(array_to_string(new.tags, ' '), ''))), 'B') ||
+    setweight(to_tsvector('portuguese', extensions.unaccent(coalesce(new.description, ''))), 'C');
+
+  if tg_op = 'INSERT' then
+    if not public.is_privileged() then
+      new.views_count := 0; new.verified_sales_count := 0; new.rating_avg := 0; new.rating_count := 0;
+      new.is_featured := false; new.moderation_notes := null;
+      if new.status = 'suspenso' then new.status := 'rascunho'; end if;
+    end if;
+    if new.status = 'publicado' then
+      raise exception 'Cadastre ao menos o pacote Básico antes de publicar o serviço.' using errcode = 'P0001';
+    end if;
+    return new;
+  end if;
+
+  if not public.is_privileged() then
+    new.freelancer_id := old.freelancer_id;
+    new.views_count := old.views_count; new.verified_sales_count := old.verified_sales_count;
+    new.rating_avg := old.rating_avg; new.rating_count := old.rating_count;
+    new.is_featured := old.is_featured; new.moderation_notes := old.moderation_notes;
+    -- preço inicial/prazo só podem ser recalculados pelo trigger de pacotes
+    if coalesce(current_setting('dali.internal_pricing', true), 'off') <> 'on' then
+      new.starting_price_cents := old.starting_price_cents; new.min_delivery_days := old.min_delivery_days;
+    end if;
+    if old.status = 'suspenso' and new.status <> 'suspenso' then
+      raise exception 'Serviço suspenso pela moderação. Entre em contato com o suporte.' using errcode = 'P0001';
+    end if;
+    if new.status = 'suspenso' and old.status <> 'suspenso' then
+      new.status := old.status;
+    end if;
+  end if;
+
+  if new.status = 'publicado' and old.status <> 'publicado' then
+    if not exists (select 1 from public.service_packages where service_id = new.id and tier = 'basico') then
+      raise exception 'Cadastre ao menos o pacote Básico antes de publicar o serviço.' using errcode = 'P0001';
+    end if;
+    new.published_at := coalesce(new.published_at, now());
+  end if;
+  return new;
+end $$;
+drop trigger if exists trg_services_before on public.services;
+create trigger trg_services_before before insert or update on public.services
+  for each row execute function public.services_before_write();
+
+-- pacotes → preço inicial e prazo mínimo do serviço
+create or replace function public.refresh_service_pricing()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_service uuid := coalesce(new.service_id, old.service_id);
+begin
+  perform set_config('dali.internal_pricing', 'on', true);
+  update public.services s
+     set starting_price_cents = sub.min_price, min_delivery_days = sub.min_days
+    from (select min(price_cents) min_price, min(delivery_days) min_days
+            from public.service_packages where service_id = v_service) sub
+   where s.id = v_service;
+  perform set_config('dali.internal_pricing', 'off', true);
+  return null;
+end $$;
+drop trigger if exists trg_packages_pricing on public.service_packages;
+create trigger trg_packages_pricing after insert or update or delete on public.service_packages
+  for each row execute function public.refresh_service_pricing();
+
+-- portfólio: só o sistema marca "entrega verificada"
+create or replace function public.protect_portfolios()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if not public.is_privileged() then
+    if tg_op = 'INSERT' then
+      new.is_verified := false; new.contract_id := null; new.origin := 'declarado';
+    else
+      new.freelancer_id := old.freelancer_id;
+      new.is_verified := old.is_verified; new.contract_id := old.contract_id; new.origin := old.origin;
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists trg_protect_portfolios on public.portfolios;
+create trigger trg_protect_portfolios before insert or update on public.portfolios
+  for each row execute function public.protect_portfolios();
+
+-- ---------------------------------------------------------------------
+-- Auditoria (ações administrativas e mudanças sensíveis)
+-- ---------------------------------------------------------------------
+create or replace function public.audit_trigger()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  v_new jsonb := case when tg_op <> 'DELETE' then to_jsonb(new) end;
+  v_old jsonb := case when tg_op <> 'INSERT' then to_jsonb(old) end;
+  v_id text;
+begin
+  -- em UPDATE, só registra mudanças relevantes (moderação/status), evitando logs desnecessários
+  if tg_op = 'UPDATE' then
+    if tg_table_name = 'freelancer_profiles'
+       and v_new -> 'approval_status' is not distinct from v_old -> 'approval_status'
+       and v_new -> 'identity_verified' is not distinct from v_old -> 'identity_verified' then
+      return null;
+    elsif tg_table_name = 'services'
+       and v_new -> 'status' is not distinct from v_old -> 'status'
+       and v_new -> 'is_featured' is not distinct from v_old -> 'is_featured' then
+      return null;
+    elsif tg_table_name = 'profiles' and v_new -> 'status' is not distinct from v_old -> 'status' then
+      return null;
+    end if;
+  end if;
+
+  v_id := coalesce(v_new, v_old) ->> (
+    case tg_table_name when 'freelancer_profiles' then 'user_id' when 'platform_settings' then 'key'
+                       when 'user_roles' then 'user_id' else 'id' end);
+
+  insert into public.audit_logs (actor_id, action, entity, entity_id, old_data, new_data)
+  values (auth.uid(), lower(tg_op), tg_table_name, v_id, v_old, v_new);
+  return null;
+end $$;
+
+do $$
+declare t text;
+begin
+  foreach t in array array['categories','platform_settings','user_roles','freelancer_profiles','services','profiles']
+  loop
+    execute format('drop trigger if exists trg_audit_%1$s on public.%1$s', t);
+    execute format('create trigger trg_audit_%1$s after insert or update or delete on public.%1$s for each row execute function public.audit_trigger()', t);
+  end loop;
+end $$;
+
+-- notificação ao freelancer quando o perfil é aprovado/rejeitado
+create or replace function public.notify_approval_change()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.approval_status is distinct from old.approval_status and new.approval_status in ('aprovado', 'rejeitado') then
+    insert into public.notifications (user_id, kind, title, body, link)
+    values (new.user_id, 'perfil_' || new.approval_status,
+            case when new.approval_status = 'aprovado' then 'Seu perfil profissional foi aprovado'
+                 else 'Seu perfil profissional precisa de ajustes' end,
+            coalesce(new.approval_notes, ''), '/painel');
+  end if;
+  return null;
+end $$;
+drop trigger if exists trg_notify_approval on public.freelancer_profiles;
+create trigger trg_notify_approval after update on public.freelancer_profiles
+  for each row execute function public.notify_approval_change();
+
+-- ---------------------------------------------------------------------
+-- Views públicas (security_invoker: respeitam o RLS de quem consulta)
+-- ---------------------------------------------------------------------
+create or replace view public.service_cards with (security_invoker = true) as
+select s.id, s.title, s.cover_url, s.category_id, s.subcategory_id,
+       c.name as category_name, c.slug as category_slug,
+       s.starting_price_cents, s.min_delivery_days, s.rating_avg, s.rating_count,
+       s.verified_sales_count, s.views_count, s.is_featured, s.tags, s.search, s.status,
+       s.published_at, s.created_at,
+       s.freelancer_id, fp.slug as freelancer_slug, p.full_name as freelancer_name,
+       p.avatar_url as freelancer_avatar, fp.level as freelancer_level,
+       fp.availability as freelancer_availability, fp.score as freelancer_score,
+       fp.is_new_talent, fp.identity_verified, fp.approval_status as freelancer_approval,
+       round((coalesce(fp.score, 60) * 0.4
+             + s.rating_avg * 8 * least(s.rating_count, 10) / 10.0
+             + least(s.verified_sales_count, 40) * 0.5
+             + case when s.is_featured then 5 else 0 end)::numeric, 2) as relevance
+  from public.services s
+  join public.freelancer_profiles fp on fp.user_id = s.freelancer_id
+  join public.profiles p on p.id = s.freelancer_id
+  join public.categories c on c.id = s.category_id;
+
+create or replace view public.freelancer_cards with (security_invoker = true) as
+select fp.user_id, fp.slug, fp.professional_title, fp.level, fp.availability, fp.experience_years,
+       fp.rating_avg, fp.rating_count, fp.completed_projects, fp.score, fp.is_new_talent,
+       fp.identity_verified, fp.approval_status, fp.main_category_id, fp.created_at,
+       c.name as main_category_name, p.full_name, p.avatar_url, p.city, p.state,
+       (select count(*) from public.services s where s.freelancer_id = fp.user_id and s.status = 'publicado') as services_count,
+       (select min(s.starting_price_cents) from public.services s where s.freelancer_id = fp.user_id and s.status = 'publicado') as min_price_cents,
+       (select coalesce(array_agg(sk.name order by sk.name), '{}') from public.freelancer_skills sk where sk.freelancer_id = fp.user_id) as skills
+  from public.freelancer_profiles fp
+  join public.profiles p on p.id = fp.user_id
+  left join public.categories c on c.id = fp.main_category_id;
+
+-- ---------------------------------------------------------------------
+-- RPCs
+-- ---------------------------------------------------------------------
+create or replace function public.increment_service_view(p_service_id uuid)
+returns void language sql security definer set search_path = public as $$
+  update public.services set views_count = views_count + 1
+   where id = p_service_id and status = 'publicado' and freelancer_id <> coalesce(auth.uid(), '00000000-0000-0000-0000-000000000000'::uuid);
+$$;
+
+create or replace function public.increment_profile_view(p_freelancer_id uuid)
+returns void language sql security definer set search_path = public as $$
+  update public.freelancer_profiles set profile_views = profile_views + 1
+   where user_id = p_freelancer_id and approval_status = 'aprovado' and user_id <> coalesce(auth.uid(), '00000000-0000-0000-0000-000000000000'::uuid);
+$$;
+
+create or replace function public.admin_stats()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_admin() then raise exception 'Acesso negado' using errcode = '42501'; end if;
+  return jsonb_build_object(
+    'total_users', (select count(*) from public.profiles),
+    'new_users_30d', (select count(*) from public.profiles where created_at > now() - interval '30 days'),
+    'freelancers_total', (select count(*) from public.freelancer_profiles),
+    'freelancers_approved', (select count(*) from public.freelancer_profiles where approval_status = 'aprovado'),
+    'freelancers_pending', (select count(*) from public.freelancer_profiles where approval_status = 'pendente'),
+    'services_published', (select count(*) from public.services where status = 'publicado'),
+    'services_total', (select count(*) from public.services),
+    'services_suspended', (select count(*) from public.services where status = 'suspenso'),
+    'categories_active', (select count(*) from public.categories where is_active),
+    'projects_open', (select count(*) from public.projects where status = 'aberto'),
+    'contracts_total', (select count(*) from public.contracts),
+    'data_requests_open', (select count(*) from public.data_requests where status in ('aberta', 'em_analise'))
+  );
+end $$;
+
+create or replace function public.admin_list_users(p_search text default null, p_limit int default 50, p_offset int default 0)
+returns table (id uuid, email text, full_name text, person_type text, status text, created_at timestamptz,
+               last_sign_in_at timestamptz, email_confirmed_at timestamptz, is_freelancer boolean,
+               freelancer_status text, roles text[])
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_admin() then raise exception 'Acesso negado' using errcode = '42501'; end if;
+  return query
+  select p.id, u.email::text, p.full_name, p.person_type, p.status, p.created_at,
+         u.last_sign_in_at, u.email_confirmed_at, (fp.user_id is not null), fp.approval_status,
+         coalesce((select array_agg(r.role) from public.user_roles r where r.user_id = p.id), '{}')
+    from public.profiles p
+    join auth.users u on u.id = p.id
+    left join public.freelancer_profiles fp on fp.user_id = p.id
+   where p_search is null or p_search = ''
+      or p.full_name ilike '%' || p_search || '%' or u.email ilike '%' || p_search || '%'
+   order by p.created_at desc
+   limit least(greatest(p_limit, 1), 200) offset greatest(p_offset, 0);
+end $$;
+
+revoke execute on function public.admin_stats() from anon;
+revoke execute on function public.admin_list_users(text, int, int) from anon;
+
+-- ---------------------------------------------------------------------
+-- Contratos: snapshot imutável da comissão (regra vigente no momento da contratação)
+-- commission_cents = round(gross * bps / 10000) em aritmética inteira (sem float)
+-- ---------------------------------------------------------------------
+create or replace function public.contracts_financial_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'INSERT' then
+    if new.commission_bps is null then
+      select (value #>> '{}')::int into new.commission_bps from public.platform_settings where key = 'commission_rate_bps';
+      new.commission_bps := coalesce(new.commission_bps, 1250);
+    end if;
+    new.commission_cents := (new.gross_amount_cents * new.commission_bps + 5000) / 10000;
+    return new;
+  end if;
+  if new.commission_bps is distinct from old.commission_bps
+     or new.commission_cents is distinct from old.commission_cents
+     or new.gross_amount_cents is distinct from old.gross_amount_cents
+     or new.client_id is distinct from old.client_id
+     or new.freelancer_id is distinct from old.freelancer_id then
+    raise exception 'Valores e partes do contrato são imutáveis. Registre um aditivo (contract_versions).' using errcode = 'P0001';
+  end if;
+  return new;
+end $$;
+drop trigger if exists trg_contracts_financial_guard on public.contracts;
+create trigger trg_contracts_financial_guard before insert or update on public.contracts
+  for each row execute function public.contracts_financial_guard();
+
+-- valida o valor da comissão em platform_settings (somente admin altera via RLS)
+create or replace function public.settings_validate()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if new.key = 'commission_rate_bps' then
+    if jsonb_typeof(new.value) <> 'number' or (new.value #>> '{}')::numeric not between 0 and 5000
+       or (new.value #>> '{}')::numeric <> trunc((new.value #>> '{}')::numeric) then
+      raise exception 'commission_rate_bps deve ser inteiro entre 0 e 5000' using errcode = 'P0001';
+    end if;
+  end if;
+  new.updated_at := now();
+  new.updated_by := auth.uid();
+  return new;
+end $$;
+drop trigger if exists trg_settings_validate on public.platform_settings;
+create trigger trg_settings_validate before insert or update on public.platform_settings
+  for each row execute function public.settings_validate();
+
+-- ---------------------------------------------------------------------
+-- Permissões EXECUTE: funções internas não ficam expostas via RPC
+-- (is_admin / is_privileged / is_service_context continuam executáveis porque as policies RLS os usam)
+-- ---------------------------------------------------------------------
+revoke execute on function public.handle_new_user() from public, anon, authenticated;
+revoke execute on function public.refresh_service_pricing() from public, anon, authenticated;
+revoke execute on function public.audit_trigger() from public, anon, authenticated;
+revoke execute on function public.notify_approval_change() from public, anon, authenticated;
+revoke execute on function public.contracts_financial_guard() from public, anon, authenticated;
+revoke execute on function public.admin_stats() from public;
+revoke execute on function public.admin_list_users(text, int, int) from public;
+grant execute on function public.admin_stats() to authenticated;
+grant execute on function public.admin_list_users(text, int, int) to authenticated;
+
+-- >>> migrations/20260101000003_rls_policies.sql
+-- =====================================================================
+-- DALI Tech Marketplace — 0003 Row Level Security
+-- Regra geral: RLS ativo em TODAS as tabelas. Sem policy = negado.
+-- Escritas financeiras/contratuais (fases 3–4) só via Edge Functions
+-- (service_role), por isso não recebem policy de escrita aqui.
+-- =====================================================================
+
+do $$
+declare t text;
+begin
+  foreach t in array array[
+    'user_roles','profiles','profile_private','consents','data_requests','categories',
+    'freelancer_profiles','freelancer_skills','services','service_packages','service_extras',
+    'portfolios','favorites','platform_settings','audit_logs','projects','proposals','contracts',
+    'contract_versions','contract_events','conversations','conversation_participants','messages',
+    'deliverables','revisions','reviews','review_reports','reputation_scores','badges',
+    'freelancer_badges','provider_accounts','payments','payment_splits','commissions','refunds',
+    'disputes','payment_webhook_events','notifications']
+  loop
+    execute format('alter table public.%I enable row level security', t);
+  end loop;
+end $$;
+
+-- Migração idempotente e não destrutiva: remove apenas as policies criadas por este arquivo.
+
+-- user_roles: leitura própria/admin; escrita apenas via SQL/service_role
+drop policy if exists roles_select on public.user_roles;
+create policy roles_select on public.user_roles for select using (user_id = (select auth.uid()) or public.is_admin());
+
+-- profiles: informações públicas (nome, foto, cidade). Dados sensíveis ficam em profile_private.
+drop policy if exists profiles_select on public.profiles;
+create policy profiles_select on public.profiles for select using (true);
+drop policy if exists profiles_insert_own on public.profiles;
+create policy profiles_insert_own on public.profiles for insert with check (id = (select auth.uid()));
+drop policy if exists profiles_update_own on public.profiles;
+create policy profiles_update_own on public.profiles for update using (id = (select auth.uid())) with check (id = (select auth.uid()));
+drop policy if exists profiles_update_admin on public.profiles;
+create policy profiles_update_admin on public.profiles for update using (public.is_admin());
+
+drop policy if exists pp_select on public.profile_private;
+create policy pp_select on public.profile_private for select using (user_id = (select auth.uid()) or public.is_admin());
+drop policy if exists pp_update on public.profile_private;
+create policy pp_update on public.profile_private for update using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+drop policy if exists pp_insert on public.profile_private;
+create policy pp_insert on public.profile_private for insert with check (user_id = (select auth.uid()));
+
+drop policy if exists consents_select on public.consents;
+create policy consents_select on public.consents for select using (user_id = (select auth.uid()) or public.is_admin());
+drop policy if exists consents_insert on public.consents;
+create policy consents_insert on public.consents for insert with check (user_id = (select auth.uid()));
+
+drop policy if exists dr_select on public.data_requests;
+create policy dr_select on public.data_requests for select using (user_id = (select auth.uid()) or public.is_admin());
+drop policy if exists dr_insert on public.data_requests;
+create policy dr_insert on public.data_requests for insert with check (user_id = (select auth.uid()) and status = 'aberta');
+drop policy if exists dr_admin_update on public.data_requests;
+create policy dr_admin_update on public.data_requests for update using (public.is_admin());
+
+-- categorias
+drop policy if exists categories_select on public.categories;
+create policy categories_select on public.categories for select using (is_active or public.is_admin());
+drop policy if exists categories_admin_ins on public.categories;
+create policy categories_admin_ins on public.categories for insert with check (public.is_admin());
+drop policy if exists categories_admin_upd on public.categories;
+create policy categories_admin_upd on public.categories for update using (public.is_admin());
+drop policy if exists categories_admin_del on public.categories;
+create policy categories_admin_del on public.categories for delete using (public.is_admin());
+
+-- freelancers: público vê apenas aprovados
+drop policy if exists fp_select on public.freelancer_profiles;
+create policy fp_select on public.freelancer_profiles for select
+  using (approval_status = 'aprovado' or user_id = (select auth.uid()) or public.is_admin());
+drop policy if exists fp_insert on public.freelancer_profiles;
+create policy fp_insert on public.freelancer_profiles for insert with check (user_id = (select auth.uid()));
+drop policy if exists fp_update_own on public.freelancer_profiles;
+create policy fp_update_own on public.freelancer_profiles for update using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+drop policy if exists fp_update_admin on public.freelancer_profiles;
+create policy fp_update_admin on public.freelancer_profiles for update using (public.is_admin());
+
+drop policy if exists skills_select on public.freelancer_skills;
+create policy skills_select on public.freelancer_skills for select using (true);
+drop policy if exists skills_write on public.freelancer_skills;
+create policy skills_write on public.freelancer_skills for all
+  using (freelancer_id = (select auth.uid())) with check (freelancer_id = (select auth.uid()));
+
+-- serviços
+drop policy if exists services_select on public.services;
+create policy services_select on public.services for select using (
+  (status = 'publicado' and exists (select 1 from public.freelancer_profiles fp
+                                     where fp.user_id = services.freelancer_id and fp.approval_status = 'aprovado'))
+  or freelancer_id = (select auth.uid()) or public.is_admin());
+drop policy if exists services_insert on public.services;
+create policy services_insert on public.services for insert with check (
+  freelancer_id = (select auth.uid())
+  and exists (select 1 from public.freelancer_profiles fp where fp.user_id = (select auth.uid())));
+drop policy if exists services_update_own on public.services;
+create policy services_update_own on public.services for update using (freelancer_id = (select auth.uid())) with check (freelancer_id = (select auth.uid()));
+drop policy if exists services_update_admin on public.services;
+create policy services_update_admin on public.services for update using (public.is_admin());
+drop policy if exists services_delete_own on public.services;
+create policy services_delete_own on public.services for delete using (freelancer_id = (select auth.uid()) and status <> 'suspenso');
+
+drop policy if exists packages_select on public.service_packages;
+create policy packages_select on public.service_packages for select
+  using (exists (select 1 from public.services s where s.id = service_id));
+drop policy if exists packages_write on public.service_packages;
+create policy packages_write on public.service_packages for all
+  using (exists (select 1 from public.services s where s.id = service_id and s.freelancer_id = (select auth.uid())))
+  with check (exists (select 1 from public.services s where s.id = service_id and s.freelancer_id = (select auth.uid())));
+
+drop policy if exists extras_select on public.service_extras;
+create policy extras_select on public.service_extras for select
+  using (exists (select 1 from public.services s where s.id = service_id));
+drop policy if exists extras_write on public.service_extras;
+create policy extras_write on public.service_extras for all
+  using (exists (select 1 from public.services s where s.id = service_id and s.freelancer_id = (select auth.uid())))
+  with check (exists (select 1 from public.services s where s.id = service_id and s.freelancer_id = (select auth.uid())));
+
+-- portfólio
+drop policy if exists portfolios_select on public.portfolios;
+create policy portfolios_select on public.portfolios for select
+  using (exists (select 1 from public.freelancer_profiles fp where fp.user_id = freelancer_id));
+drop policy if exists portfolios_write on public.portfolios;
+create policy portfolios_write on public.portfolios for all
+  using (freelancer_id = (select auth.uid())) with check (freelancer_id = (select auth.uid()));
+
+-- favoritos (privados)
+drop policy if exists favorites_all on public.favorites;
+create policy favorites_all on public.favorites for all
+  using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+
+-- configurações: públicas só as marcadas; escrita admin
+drop policy if exists settings_select on public.platform_settings;
+create policy settings_select on public.platform_settings for select using (is_public or public.is_admin());
+drop policy if exists settings_admin_write on public.platform_settings;
+create policy settings_admin_write on public.platform_settings for all using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists audit_select on public.audit_logs;
+create policy audit_select on public.audit_logs for select using (public.is_admin());
+
+-- ---------------------- Fases 3+ (leitura restrita a participantes) ----------------------
+drop policy if exists projects_select on public.projects;
+create policy projects_select on public.projects for select
+  using (status in ('aberto', 'em_negociacao') or client_id = (select auth.uid()) or public.is_admin());
+drop policy if exists projects_insert on public.projects;
+create policy projects_insert on public.projects for insert with check (client_id = (select auth.uid()));
+drop policy if exists projects_update on public.projects;
+create policy projects_update on public.projects for update using (client_id = (select auth.uid())) with check (client_id = (select auth.uid()));
+
+drop policy if exists proposals_select on public.proposals;
+create policy proposals_select on public.proposals for select
+  using (client_id = (select auth.uid()) or freelancer_id = (select auth.uid()) or public.is_admin());
+
+drop policy if exists contracts_select on public.contracts;
+create policy contracts_select on public.contracts for select
+  using (client_id = (select auth.uid()) or freelancer_id = (select auth.uid()) or public.is_admin());
+
+drop policy if exists cv_select on public.contract_versions;
+create policy cv_select on public.contract_versions for select using (exists (
+  select 1 from public.contracts c where c.id = contract_id
+   and (c.client_id = (select auth.uid()) or c.freelancer_id = (select auth.uid()) or public.is_admin())));
+drop policy if exists ce_select on public.contract_events;
+create policy ce_select on public.contract_events for select using (exists (
+  select 1 from public.contracts c where c.id = contract_id
+   and (c.client_id = (select auth.uid()) or c.freelancer_id = (select auth.uid()) or public.is_admin())));
+drop policy if exists deliverables_select on public.deliverables;
+create policy deliverables_select on public.deliverables for select using (exists (
+  select 1 from public.contracts c where c.id = contract_id
+   and (c.client_id = (select auth.uid()) or c.freelancer_id = (select auth.uid()) or public.is_admin())));
+drop policy if exists revisions_select on public.revisions;
+create policy revisions_select on public.revisions for select using (exists (
+  select 1 from public.contracts c where c.id = contract_id
+   and (c.client_id = (select auth.uid()) or c.freelancer_id = (select auth.uid()) or public.is_admin())));
+drop policy if exists disputes_select on public.disputes;
+create policy disputes_select on public.disputes for select using (exists (
+  select 1 from public.contracts c where c.id = contract_id
+   and (c.client_id = (select auth.uid()) or c.freelancer_id = (select auth.uid()) or public.is_admin())));
+
+drop policy if exists cp_select on public.conversation_participants;
+create policy cp_select on public.conversation_participants for select
+  using (user_id = (select auth.uid()) or public.is_admin());
+drop policy if exists conversations_select on public.conversations;
+create policy conversations_select on public.conversations for select using (exists (
+  select 1 from public.conversation_participants cp where cp.conversation_id = conversations.id and cp.user_id = (select auth.uid())));
+drop policy if exists messages_select on public.messages;
+create policy messages_select on public.messages for select using (exists (
+  select 1 from public.conversation_participants cp where cp.conversation_id = messages.conversation_id and cp.user_id = (select auth.uid())));
+drop policy if exists messages_insert on public.messages;
+create policy messages_insert on public.messages for insert with check (
+  sender_id = (select auth.uid()) and kind in ('texto', 'arquivo') and exists (
+  select 1 from public.conversation_participants cp where cp.conversation_id = messages.conversation_id and cp.user_id = (select auth.uid())));
+
+drop policy if exists reviews_select on public.reviews;
+create policy reviews_select on public.reviews for select
+  using (status = 'publicada' or reviewer_id = (select auth.uid()) or freelancer_id = (select auth.uid()) or public.is_admin());
+drop policy if exists review_reports_insert on public.review_reports;
+create policy review_reports_insert on public.review_reports for insert with check (reporter_id = (select auth.uid()));
+drop policy if exists review_reports_select on public.review_reports;
+create policy review_reports_select on public.review_reports for select using (reporter_id = (select auth.uid()) or public.is_admin());
+
+drop policy if exists rep_scores_select on public.reputation_scores;
+create policy rep_scores_select on public.reputation_scores for select using (true);
+drop policy if exists badges_select on public.badges;
+create policy badges_select on public.badges for select using (true);
+drop policy if exists fbadges_select on public.freelancer_badges;
+create policy fbadges_select on public.freelancer_badges for select using (true);
+
+drop policy if exists provider_accounts_select on public.provider_accounts;
+create policy provider_accounts_select on public.provider_accounts for select using (user_id = (select auth.uid()) or public.is_admin());
+
+drop policy if exists payments_select on public.payments;
+create policy payments_select on public.payments for select using (exists (
+  select 1 from public.contracts c where c.id = contract_id
+   and (c.client_id = (select auth.uid()) or c.freelancer_id = (select auth.uid()) or public.is_admin())));
+drop policy if exists splits_select on public.payment_splits;
+create policy splits_select on public.payment_splits for select using (recipient_user_id = (select auth.uid()) or public.is_admin());
+drop policy if exists commissions_select on public.commissions;
+create policy commissions_select on public.commissions for select using (public.is_admin() or exists (
+  select 1 from public.contracts c where c.id = contract_id and c.freelancer_id = (select auth.uid())));
+drop policy if exists refunds_select on public.refunds;
+create policy refunds_select on public.refunds for select using (public.is_admin() or exists (
+  select 1 from public.contracts c where c.id = contract_id
+   and (c.client_id = (select auth.uid()) or c.freelancer_id = (select auth.uid()))));
+drop policy if exists webhook_events_select on public.payment_webhook_events;
+create policy webhook_events_select on public.payment_webhook_events for select using (public.is_admin());
+
+drop policy if exists notifications_select on public.notifications;
+create policy notifications_select on public.notifications for select using (user_id = (select auth.uid()));
+drop policy if exists notifications_update on public.notifications;
+create policy notifications_update on public.notifications for update using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+
+-- >>> migrations/20260101000004_storage.sql
+-- =====================================================================
+-- DALI Tech Marketplace — 0004 Supabase Storage
+-- Limites pensados para o plano gratuito (1 GB de storage total, 50 MB/arquivo).
+-- Tipos MIME e tamanho são validados PELO STORAGE (servidor), não só no front.
+-- Nenhum bucket aceita executáveis: só imagens (jpeg/png/webp) e PDF (+ zip em entregas).
+--
+-- Públicos (leitura por URL pública; escrita só na pasta "<auth.uid()>/..."):
+--   avatars (2 MB) · portfolio (5 MB) · services (3 MB)
+-- Privados:
+--   verification-docs   (5 MB)  → "<auth.uid()>/..."  dono + admin
+--   project-deliverables (20 MB) → "<contract_id>/..." participantes do contrato + admin
+--
+-- Arquivos substituídos: o front-end remove o objeto anterior ao trocar avatar/capa
+-- (ver frontend/src/lib/storage.ts). Limpeza de órfãos: ver docs/SUPABASE.md.
+-- =====================================================================
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types) values
+  ('avatars',              'avatars',              true,  2097152,  array['image/jpeg', 'image/png', 'image/webp']),
+  ('portfolio',            'portfolio',            true,  5242880,  array['image/jpeg', 'image/png', 'image/webp', 'application/pdf']),
+  ('services',             'services',             true,  3145728,  array['image/jpeg', 'image/png', 'image/webp', 'application/pdf']),
+  ('verification-docs',    'verification-docs',    false, 5242880,  array['image/jpeg', 'image/png', 'image/webp', 'application/pdf']),
+  ('project-deliverables', 'project-deliverables', false, 20971520, array['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'application/zip',
+                                                                          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                                                                          'application/vnd.ms-excel.sheet.macroEnabled.12',
+                                                                          'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                                                                          'text/csv'])
+on conflict (id) do update
+  set public = excluded.public, file_size_limit = excluded.file_size_limit, allowed_mime_types = excluded.allowed_mime_types;
+
+-- helper: participante de contrato (para a pasta "<contract_id>/...")
+create or replace function public.is_contract_participant(p_contract text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.contracts c
+     where c.id::text = p_contract
+       and (c.client_id = auth.uid() or c.freelancer_id = auth.uid()))
+$$;
+
+drop policy if exists "dali_own_select" on storage.objects;
+drop policy if exists "dali_own_insert" on storage.objects;
+drop policy if exists "dali_own_update" on storage.objects;
+drop policy if exists "dali_own_delete" on storage.objects;
+drop policy if exists "dali_verif_admin_select" on storage.objects;
+drop policy if exists "dali_deliv_select" on storage.objects;
+drop policy if exists "dali_deliv_insert" on storage.objects;
+
+-- buckets de pasta própria (públicos + verification-docs)
+create policy "dali_own_select" on storage.objects for select to authenticated
+  using (bucket_id in ('avatars', 'portfolio', 'services', 'verification-docs')
+         and (storage.foldername(name))[1] = (select auth.uid())::text);
+create policy "dali_own_insert" on storage.objects for insert to authenticated
+  with check (bucket_id in ('avatars', 'portfolio', 'services', 'verification-docs')
+              and (storage.foldername(name))[1] = (select auth.uid())::text);
+create policy "dali_own_update" on storage.objects for update to authenticated
+  using (bucket_id in ('avatars', 'portfolio', 'services', 'verification-docs')
+         and (storage.foldername(name))[1] = (select auth.uid())::text);
+create policy "dali_own_delete" on storage.objects for delete to authenticated
+  using (bucket_id in ('avatars', 'portfolio', 'services', 'verification-docs')
+         and (storage.foldername(name))[1] = (select auth.uid())::text);
+
+-- documentos de verificação: admin pode ler para análise
+create policy "dali_verif_admin_select" on storage.objects for select to authenticated
+  using (bucket_id = 'verification-docs' and public.is_admin());
+
+-- entregas: somente participantes do contrato (pasta = id do contrato) e admin
+create policy "dali_deliv_select" on storage.objects for select to authenticated
+  using (bucket_id = 'project-deliverables'
+         and (public.is_contract_participant((storage.foldername(name))[1]) or public.is_admin()));
+create policy "dali_deliv_insert" on storage.objects for insert to authenticated
+  with check (bucket_id = 'project-deliverables'
+              and public.is_contract_participant((storage.foldername(name))[1]));
+-- sem update/delete em entregas: histórico de versões é preservado
+
+-- >>> migrations/20260101000005_seed_reference_data.sql
+-- =====================================================================
+-- DALI Tech Marketplace — 0005 Dados de referência (produção)
+-- Categorias, subcategorias, selos e configurações. Não contém dados fictícios.
+-- =====================================================================
+
+with cats(slug, name, description, icon, sort_order) as (values
+  ('excel-planilhas', 'Excel e Planilhas', 'Planilhas automatizadas, fórmulas avançadas, VBA, Power Query e controles.', 'FileSpreadsheet', 1),
+  ('power-bi', 'Power BI e Business Intelligence', 'Dashboards gerenciais, modelagem de dados, DAX e relatórios.', 'BarChart3', 2),
+  ('powerpoint', 'PowerPoint e Apresentações', 'Apresentações comerciais, executivas, pitch decks e templates.', 'Presentation', 3),
+  ('ia-automacao', 'Inteligência Artificial e Automação', 'Agentes de IA, chatbots, n8n, Make, Zapier e integrações via API.', 'Bot', 4),
+  ('desenvolvimento', 'Desenvolvimento', 'Sites, sistemas web, aplicativos, APIs, bancos de dados e correções.', 'Code2', 5),
+  ('consultoria-treinamentos', 'Consultoria e Treinamentos', 'Aulas, cursos, mentorias e consultoria de dados e negócios.', 'GraduationCap', 6)
+)
+insert into public.categories (slug, name, description, icon, sort_order)
+select slug, name, description, icon, sort_order from cats
+on conflict (slug) do update set name = excluded.name, description = excluded.description, icon = excluded.icon, sort_order = excluded.sort_order;
+
+with subs(parent_slug, name, sort_order) as (values
+  ('excel-planilhas', 'Planilhas automatizadas', 1), ('excel-planilhas', 'Fórmulas avançadas', 2),
+  ('excel-planilhas', 'VBA e macros', 3), ('excel-planilhas', 'Power Query', 4),
+  ('excel-planilhas', 'Dashboards em Excel', 5), ('excel-planilhas', 'Controles financeiros', 6),
+  ('excel-planilhas', 'Controle de estoque', 7), ('excel-planilhas', 'Planejamento comercial', 8),
+  ('excel-planilhas', 'Gestão empresarial', 9), ('excel-planilhas', 'Modelos de orçamento', 10),
+  ('power-bi', 'Dashboards gerenciais', 1), ('power-bi', 'Modelagem de dados', 2), ('power-bi', 'DAX', 3),
+  ('power-bi', 'Integração de fontes', 4), ('power-bi', 'Relatórios financeiros', 5),
+  ('power-bi', 'Indicadores comerciais', 6), ('power-bi', 'Gestão de estoque (BI)', 7),
+  ('power-bi', 'Análises operacionais', 8), ('power-bi', 'Correção de dashboards', 9),
+  ('powerpoint', 'Apresentações comerciais', 1), ('powerpoint', 'Apresentações institucionais', 2),
+  ('powerpoint', 'Pitch decks', 3), ('powerpoint', 'Propostas comerciais', 4), ('powerpoint', 'Templates', 5),
+  ('powerpoint', 'Apresentações executivas', 6),
+  ('ia-automacao', 'Agentes de IA', 1), ('ia-automacao', 'Chatbots', 2), ('ia-automacao', 'Automações n8n', 3),
+  ('ia-automacao', 'Integrações Make', 4), ('ia-automacao', 'Integrações Zapier', 5),
+  ('ia-automacao', 'Automação de processos', 6), ('ia-automacao', 'Integrações via API (automação)', 7),
+  ('desenvolvimento', 'Sites', 1), ('desenvolvimento', 'Sistemas web', 2), ('desenvolvimento', 'Aplicativos', 3),
+  ('desenvolvimento', 'Banco de dados', 4), ('desenvolvimento', 'APIs', 5), ('desenvolvimento', 'Integrações', 6),
+  ('desenvolvimento', 'Correção de bugs', 7), ('desenvolvimento', 'Sistemas de gestão', 8),
+  ('consultoria-treinamentos', 'Aulas de Excel', 1), ('consultoria-treinamentos', 'Cursos de Power BI', 2),
+  ('consultoria-treinamentos', 'Mentorias', 3), ('consultoria-treinamentos', 'Consultoria de dados', 4),
+  ('consultoria-treinamentos', 'Consultoria empresarial', 5), ('consultoria-treinamentos', 'Treinamentos corporativos', 6)
+)
+insert into public.categories (parent_id, slug, name, sort_order)
+select c.id, public.slugify(s.name), s.name, s.sort_order
+  from subs s join public.categories c on c.slug = s.parent_slug
+on conflict (slug) do update set parent_id = excluded.parent_id, name = excluded.name, sort_order = excluded.sort_order;
+
+-- selos: atribuídos SOMENTE pelo sistema (freelancer_badges não tem policy de escrita)
+insert into public.badges (code, name, description, icon, criteria) values
+  ('novo_talento', 'Novo talento', 'Profissional recém-chegado, ainda sem histórico suficiente para score.', 'Sparkles',
+   '{"regra": "menos de 3 contratos concluídos na plataforma"}'),
+  ('identidade_verificada', 'Identidade verificada', 'Documentos conferidos pela equipe DALI Tech.', 'ShieldCheck',
+   '{"regra": "documento validado manualmente por administrador"}'),
+  ('profissional_destaque', 'Profissional destaque', 'Score alto com volume consistente de entregas.', 'Star',
+   '{"regra": "score >= 80 e ao menos 10 contratos concluídos"}'),
+  ('especialista', 'Especialista', 'Domínio comprovado na categoria principal.', 'Award',
+   '{"regra": "ao menos 15 contratos concluídos na categoria principal com nota média >= 4,5"}'),
+  ('top_freelancer', 'Top Freelancer', 'Entre os melhores do ranking da categoria.', 'Trophy',
+   '{"regra": "top 10% do ranking ponderado da categoria, mínimo 20 avaliações"}'),
+  ('excelencia_entregas', 'Excelência em entregas', 'Alta taxa de entregas no prazo e aprovadas.', 'CheckCircle2',
+   '{"regra": "pontualidade >= 95% e aprovação sem disputa >= 95%, mínimo 10 entregas"}')
+on conflict (code) do update set name = excluded.name, description = excluded.description, icon = excluded.icon, criteria = excluded.criteria;
+
+insert into public.platform_settings (key, value, description, is_public) values
+  ('commission_rate_bps', '1250', 'Comissão da plataforma em pontos-base (1250 = 12,5%). Afeta apenas novos contratos.', true),
+  ('payment_provider', '"asaas"', 'Provedor de pagamentos ativo.', false),
+  ('payment_environment', '"sandbox"', 'Ambiente do provedor: sandbox | production.', false),
+  ('payments_enabled', 'false', 'Liga/desliga cobranças reais. Exige validação administrativa.', true),
+  ('ai_assistant_enabled', 'false', 'Assistente de IA (opcional, desativado).', true),
+  ('max_upload_mb', '5', 'Limite de upload por arquivo (MB).', true),
+  ('terms_version', '"2026-01-rascunho"', 'Versão vigente dos termos aceitos no cadastro.', true)
+on conflict (key) do nothing;
